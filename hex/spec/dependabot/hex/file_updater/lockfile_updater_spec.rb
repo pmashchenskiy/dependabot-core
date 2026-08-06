@@ -302,6 +302,17 @@ RSpec.describe Dependabot::Hex::FileUpdater::LockfileUpdater do
         end
       end
 
+      context "with a slash-containing source in an exact missing-credentials diagnostic" do
+        let(:error_message) { 'Missing credentials for "acme/private"' }
+
+        it "raises a PrivateSourceAuthenticationFailure error" do
+          expect { updated_lockfile_content }
+            .to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
+              expect(error.source).to eq("acme/private")
+            end
+        end
+      end
+
       context "with unknown mix run error" do
         let(:error_message) { "Unknown subprocess error occurred" }
         let(:subprocess_error_cause) { RuntimeError.new("original helper cause") }

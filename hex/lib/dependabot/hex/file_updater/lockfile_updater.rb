@@ -98,17 +98,9 @@ module Dependabot
 
         sig { params(error: SharedHelpers::HelperSubprocessFailed).returns(StandardError) }
         def handle_hex_errors(error)
-          match = error.message.match(
-            /
-              (?:\A|\n)
-              (?:\*\*[ ]\(Mix\)[ ])?
-              No[ ]authenticated[ ]organization[ ]found[ ]for[ ]
-              (?<source>[A-Za-z0-9_.-]+)\.(?=\s|\z)
-            /x
-          )
-          match ||= error.message.match(/\AMissing credentials for "(?<source>[A-Za-z0-9_.-]+)"\z/)
+          source = CredentialHelpers.authentication_source(error.message)
 
-          return Dependabot::PrivateSourceAuthenticationFailure.new(match[:source]) if match
+          return Dependabot::PrivateSourceAuthenticationFailure.new(source) if source
 
           error
         end

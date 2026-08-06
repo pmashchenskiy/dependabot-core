@@ -68,32 +68,19 @@ module Dependabot
         )
       end
 
-      sig { params(credentials: T::Array[Dependabot::Credential]).returns(T::Array[Dependabot::Credential]) }
-      def self.hex_credentials(credentials)
-        organization_credentials(credentials) + repo_credentials(credentials)
-      end
-
-      sig { params(credentials: T.untyped).returns(T::Array[Dependabot::Credential]) }
-      def self.organization_credentials(credentials)
-        defaults = Dependabot::Credential.new({ "organization" => "", "token" => "" })
-        keys = %w(type organization token)
-
-        credentials
-          .select { |cred| cred["type"] == "hex_organization" }
-          .flat_map { |cred| defaults.merge(cred).slice(*keys).values }
-      end
-      sig { params(credentials: T::Array[Dependabot::Credential]).returns(T::Array[Dependabot::Credential]) }
-      def self.repo_credentials(credentials)
-        # Credentials are serialized as an array that may not have optional fields. Using a
-        # default ensures that the array is always the same length, even if values are empty.
-        defaults = Dependabot::Credential.new(
-          { "url" => "", "auth_key" => "", "public_key_fingerprint" => "", "public_key" => "" }
+      sig { params(message: String).returns(T.nilable(String)) }
+      def self.authentication_source(message)
+        match = message.match(
+          /
+            (?:\A|\n)
+            (?:\*\*[ ]\(Mix\)[ ])?
+            No[ ]authenticated[ ]organization[ ]found[ ]for[ ]
+            (?<source>[^"\r\n]+?)\.(?=\s|\z)
+          /x
         )
-        keys = %w(type repo url auth_key public_key_fingerprint public_key)
+        match ||= message.match(/\AMissing credentials for "(?<source>[^"\r\n]+)"\z/)
 
-        credentials
-          .select { |cred| cred["type"] == "hex_repository" }
-          .flat_map { |cred| defaults.merge(underscore_keys(cred)).slice(*keys).values }
+        match && match[:source]
       end
 
       # Job credentials use the dependabot.yml spelling of keys (e.g. `public-key-fingerprint`).

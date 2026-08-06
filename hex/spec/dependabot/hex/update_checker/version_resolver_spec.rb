@@ -12,11 +12,11 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
     described_class.new(
       dependency: dependency,
       prepared_dependency_files: prepared_files,
-      original_dependency_files: original_files,
       credentials: credentials
     )
   end
 
+  let(:mix_attempts) { [] }
   let(:credentials) do
     [
       Dependabot::Credential.new(
@@ -45,7 +45,6 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
     [{ file: "mix.exs", requirement: "~> 1.3.0", groups: [], source: nil }]
   end
 
-  let(:original_files) { [mixfile, lockfile] }
   let(:prepared_files) { [sanitized_mixfile, lockfile] }
   let(:mixfile) do
     Dependabot::DependencyFile.new(
@@ -91,7 +90,6 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
 
     context "with a call to read a version file in a support file" do
       let(:mixfile_fixture_name) { "loads_file_with_require" }
-      let(:original_files) { [mixfile, lockfile, support_file] }
       let(:prepared_files) { [sanitized_mixfile, lockfile, support_file] }
       let(:support_file) do
         Dependabot::DependencyFile.new(
@@ -118,9 +116,12 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
     context "with an unresolvable mixfile" do
       let(:mixfile_fixture_name) { "unresolvable" }
 
-      it "raises a Dependabot::DependencyFileNotResolvable error" do
+      it "preserves Hex's generic resolution failure" do
         expect { resolver.latest_resolvable_version }
-          .to raise_error(Dependabot::DependencyFileNotResolvable)
+          .to raise_error(
+            Dependabot::SharedHelpers::HelperSubprocessFailed,
+            "** (Mix) Hex dependency resolution failed"
+          )
       end
     end
 
@@ -130,6 +131,198 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
       it "respects the resolvability of the mix.exs" do
         expect(latest_resolvable_version).to be > Gem::Version.new("1.3.5")
         expect(latest_resolvable_version).to be < Gem::Version.new("1.4.0")
+      end
+    end
+
+    context "when the update helper writes a result alongside stdout output" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including("mix", "run", end_with("/check_update.exs"), "plug"), anything) do
+            File.write(".dependabot-result", "1.3.6")
+            "warning from mix.exs"
+          end
+      end
+
+      it "reads the version from the filesystem using an isolated Hex home" do
+        expect(latest_resolvable_version).to eq(Dependabot::Hex::Version.new("1.3.6"))
+        expect(Dependabot::SharedHelpers).to have_received(:run_shell_command).with(
+          array_including("mix", "run", end_with("/check_update.exs"), "--", "plug"),
+          hash_including(
+            env: hash_including("HEX_HOME" => a_string_matching(%r{/dependabot-hex-home})),
+            fingerprint: "mix run check_update.exs <dependency_name>",
+            timeout: 30
+          )
+        )
+      end
+    end
+
+    context "when the update helper returns a git SHA" do
+      let(:git_sha) { "a" * 40 }
+
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including(end_with("/check_update.exs"), "plug"), anything) do
+            File.write(".dependabot-result", git_sha)
+            ""
+          end
+      end
+
+      it "returns the SHA without parsing it as a version" do
+        expect(latest_resolvable_version).to eq(git_sha)
+      end
+    end
+
+    context "when the update helper does not write a result" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including(end_with("/check_update.exs"), "plug"), anything)
+          .and_return("")
+      end
+
+      it "preserves the missing result as an internal error" do
+        expect { latest_resolvable_version }.to raise_error(Errno::ENOENT, /\.dependabot-result/)
+      end
+    end
+
+    context "when the update helper writes an invalid result" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including(end_with("/check_update.exs"), "plug"), anything) do
+            File.write(".dependabot-result", "not a version")
+            ""
+          end
+      end
+
+      it "preserves the invalid result as an internal error" do
+        expect { latest_resolvable_version }.to raise_error(ArgumentError, /Malformed version number string/)
+      end
+    end
+
+    context "when dependency resolution times out" do
+      let(:timeout_error) do
+        helper_failure(
+          "Timed out due to inactivity after 30 seconds",
+          process_exit_value: "pid 123 exit 124"
+        )
+      end
+
+      before do
+        stub_resolution_failure(timeout_error)
+      end
+
+      it "preserves the inactivity timeout as an internal helper failure after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, /30 seconds/)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "when Hex names the unauthenticated source" do
+      let(:authentication_error) do
+        helper_failure("** (Mix) No authenticated organization found for dependabot.")
+      end
+
+      before { stub_resolution_failure(authentication_error) }
+
+      it "reports that source after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
+            expect(error.source).to eq("dependabot")
+          end
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "when Hex includes the prompt after the unauthenticated source" do
+      let(:authentication_error) do
+        helper_failure(
+          "** (Mix) No authenticated organization found for dependabot. Do you want to authenticate now? [Yn]"
+        )
+      end
+
+      before { stub_resolution_failure(authentication_error) }
+
+      it "reports that source after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
+            expect(error.source).to eq("dependabot")
+          end
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "when repository credentials omit the URL" do
+      let(:credentials) do
+        [
+          Dependabot::Credential.new(
+            {
+              "type" => "hex_repository",
+              "repo" => "acme/private"
+            }
+          )
+        ]
+      end
+
+      it "reports the repository name" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
+            expect(error.source).to eq("acme/private")
+          end
+      end
+    end
+
+    context "with credentials configured for resolution" do
+      let(:credentials) do
+        [
+          Dependabot::Credential.new(
+            {
+              "type" => "hex_repository",
+              "repo" => "private_repo",
+              "url" => "https://private.example",
+              "public_key" => "public key"
+            }
+          )
+        ]
+      end
+
+      it "shares one external temporary Hex home and removes it afterwards" do
+        hex_homes = []
+        mix_exs_values = []
+        project_directory = T.let(nil, T.nilable(String))
+        original_mix_exs = ENV.fetch("MIX_EXS", nil)
+
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including("lib/configure_credentials.exs"), anything) do |_command, options|
+            hex_homes << options.fetch(:env).fetch("HEX_HOME")
+            mix_exs_values << options.fetch(:env).fetch("MIX_EXS")
+            ""
+          end
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including(end_with("/check_update.exs")), anything) do |_command, options|
+            hex_homes << options.fetch(:env).fetch("HEX_HOME")
+            mix_exs_values << options.fetch(:env).fetch("MIX_EXS")
+            project_directory = Dir.pwd
+            File.write(".dependabot-result", "1.3.6")
+
+            ""
+          end
+
+        ENV["MIX_EXS"] = "inherited/mix.exs"
+        expect(latest_resolvable_version).to eq(Dependabot::Hex::Version.new("1.3.6"))
+        expect(hex_homes.length).to eq(2)
+        expect(hex_homes.uniq.length).to eq(1)
+        expect(mix_exs_values.uniq).to eq(["mix.exs"])
+        expect(project_directory).not_to be_nil
+        expect(hex_homes.first).not_to start_with(project_directory.to_s)
+        expect(File.exist?(hex_homes.first)).to be(false)
+      ensure
+        ENV["MIX_EXS"] = original_mix_exs
       end
     end
 
@@ -143,239 +336,231 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
     end
 
     context "when the environments for another dependency diverge" do
-      # In this example, updating `credo` would add its sub-dependency,
-      # `poison`, to the `dev` environment, but the Mixfile explicitly specifies
-      # that `poison` should only be available in the `test` environment.
-      let(:mixfile_fixture_name) { "diverging_environments" }
-      let(:lockfile_fixture_name) { "diverging_environments" }
+      let(:divergence_error) { helper_failure("Dependencies have diverged") }
 
-      let(:dependency_name) { "credo" }
-      let(:version) { "0.6.0" }
-      let(:dependency_requirements) do
-        [{
-          file: "mix.exs",
-          requirement: "~> 0.6",
-          groups: %w(dev test),
-          source: nil
-        }]
-      end
+      before { stub_resolution_failure(divergence_error) }
 
-      it "raises a Dependabot::DependencyFileNotResolvable error" do
+      it "returns no update after one attempt" do
         # In an ideal world, Dependabot would update the environment specified
-        # for `poison` in the Mixfile. In the meantime, though, we just treat
-        # this as an impossible-to-update dependency.
+        # in the Mixfile. In the meantime, we treat this as impossible to update.
         expect(resolver.latest_resolvable_version).to be_nil
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
-    context "when a source-less OAuth token exchange fails" do
-      let(:oauth_error) do
-        Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-          message: "Failed to exchange API key for OAuth token",
-          error_context: {}
+    context "with an invalid requirement diagnostic" do
+      let(:invalid_requirement_error) do
+        helper_failure("** (Version.InvalidRequirementError) invalid requirement: >= nope")
+      end
+
+      before { stub_resolution_failure(invalid_requirement_error) }
+
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "with Hex 2.5.4's malformed requirement diagnostic" do
+      let(:invalid_requirement_error) do
+        helper_failure(
+          "** (Mix) Required version >= nope for package jason is incorrectly specified (from: mix.exs)"
         )
       end
 
-      before do
-        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).and_raise(oauth_error)
-      end
+      before { stub_resolution_failure(invalid_requirement_error) }
 
-      context "with one organization credential" do
-        let(:credentials) { [organization_credential("dependabot")] }
-
-        it "does not attribute the source-less failure to that organization" do
-          expect { latest_resolvable_version }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
-      end
-
-      context "with duplicate credentials for one organization" do
-        let(:credentials) do
-          [
-            organization_credential("dependabot", token: "first-token"),
-            organization_credential("dependabot", token: "second-token")
-          ]
-        end
-
-        it "does not infer a source from duplicate credentials" do
-          expect { latest_resolvable_version }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
-    context "when update-check diagnostics include repository query credentials" do
-      let(:repository_secret) { "secret%2Bvalue" }
-      let(:repository_url) { "https://repo.example.com?access_token=#{repository_secret}" }
-      let(:credentials) { [repository_credential(repository_url)] }
-      let(:secret_error) do
-        Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-          message: "Request failed for #{repository_url}",
-          error_context: {
-            stderr_output: "Request failed for #{repository_url}",
-            args: [["hex_repository", "dependabot", repository_url]]
-          },
-          trace: ["Request failed for #{repository_url}"]
+    context "with Hex 2.5.4's malformed requirement diagnostic in an umbrella app" do
+      let(:invalid_requirement_error) do
+        helper_failure(
+          "** (Mix) Required version >= nope for package jason is incorrectly specified " \
+          "(from: apps/dependabot_business/mix.exs)"
         )
       end
 
-      context "when checking the prepared requirements fails" do
-        before { stub_update_checks(secret_error, "1.3.6") }
+      before { stub_resolution_failure(invalid_requirement_error) }
 
-        it "redacts and detaches the helper failure" do
-          expect { latest_resolvable_version }
-            .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed) do |error|
-              expect(error.message).to include("access_token=***")
-              expect(error.full_message).not_to include(repository_secret)
-              expect(error.error_context.inspect).not_to include(repository_secret)
-              expect(error.trace&.join).not_to include(repository_secret)
-              expect(error.cause).to be_nil
-            end
-        end
-      end
-
-      context "when a sanitized failure is translated to an authentication error" do
-        let(:authentication_error) do
-          Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-            message: "Missing credentials for \"dependabot\"\nRequest failed for #{repository_url}",
-            error_context: {}
-          )
-        end
-
-        before { stub_update_checks(authentication_error) }
-
-        it "redacts and detaches the authentication error" do
-          expect { latest_resolvable_version }
-            .to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
-              expect(error.source).to eq("dependabot")
-              expect(error.full_message).not_to include(repository_secret)
-              expect(error.cause).to be_nil
-            end
-        end
-      end
-
-      context "when the original requirements fail without needing redaction" do
-        let(:original_requirements_error) do
-          Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-            message: "Original requirements failed",
-            error_context: {}
-          )
-        end
-
-        before { stub_update_checks(secret_error, original_requirements_error) }
-
-        it "detaches the not-resolvable error from the sanitized outer failure" do
-          expect { latest_resolvable_version }
-            .to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
-              expect(error.message).to eq("Original requirements failed")
-              expect(error.full_message).not_to include(repository_secret)
-              expect(error.cause).to be_nil
-            end
-        end
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
-    context "when update-check error context contains the legacy credential payload" do
-      let(:organization_token) { "organization-secret-token" }
-      let(:repository_auth_key) { "repository-secret-auth-key" }
-      let(:repository_public_key) { "-----BEGIN PUBLIC KEY-----\nrepository-secret-pem\n-----END PUBLIC KEY-----" }
-      let(:repository_url) do
-        "https://url-user:url-password@repo.example.com/packages?access_token=query-secret"
+    context "with Hex 2.5.4's malformed requirement diagnostic in an umbrella path containing spaces" do
+      let(:invalid_requirement_error) do
+        helper_failure(
+          "** (Mix) Required version >= nope for package jason is incorrectly specified " \
+          "(from: umbrella apps/business/mix.exs)"
+        )
       end
+
+      before { stub_resolution_failure(invalid_requirement_error) }
+
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "with Hex 2.5.4's malformed requirement diagnostic in a Unicode umbrella path" do
+      let(:invalid_requirement_error) do
+        helper_failure(
+          "** (Mix) Required version >= nope for package jason is incorrectly specified " \
+          "(from: apps/geschäft/mix.exs)"
+        )
+      end
+
+      before { stub_resolution_failure(invalid_requirement_error) }
+
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "with a generic Hex dependency resolution failure" do
+      let(:resolution_error) { helper_failure("** (Mix) Hex dependency resolution failed") }
+
+      before { stub_resolution_failure(resolution_error) }
+
+      it "preserves the original helper failure after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, resolution_error.message)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "when a resolution error contains a raw repository URL query pair" do
+      let(:repository_url) { "https://private.example?access_token=secret%2Bvalue" }
       let(:credentials) do
         [
-          organization_credential("dependabot", token: organization_token),
           Dependabot::Credential.new(
             {
               "type" => "hex_repository",
-              "repo" => "dependabot",
-              "url" => repository_url,
-              "auth-key" => repository_auth_key,
-              "public-key" => repository_public_key
+              "repo" => "private_repo",
+              "url" => repository_url
             }
           )
         ]
       end
-      let(:credential_payload_error) do
+      let(:resolution_error) do
         Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-          message: "Update check failed",
-          error_context: {
-            command: "mix run check_update.exs",
-            function: "get_latest_resolvable_version",
-            args: ["/tmp/project", dependency_name, Dependabot::Hex::CredentialHelpers.hex_credentials(credentials)]
-          }
+          message: "Could not fetch #{repository_url}",
+          error_context: { "url" => repository_url },
+          trace: ["Fetching #{repository_url}"]
         )
       end
+      let(:cause) { RuntimeError.new("cause contains secret%2Bvalue") }
 
-      before { stub_update_checks(credential_payload_error, "1.3.6") }
+      before do
+        allow(Dependabot::Hex::CredentialHelpers).to receive(:configure)
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .with(array_including(end_with("/check_update.exs"), dependency_name), anything) do
+            mix_attempts << :resolution
+            raise resolution_error, cause: cause
+          end
+      end
 
-      it "removes the credential arguments while retaining safe diagnostic context" do
+      it "sanitizes the error and detaches the original cause" do
         expect { latest_resolvable_version }
           .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed) do |error|
-            expect(error.error_context).to include(
-              command: "mix run check_update.exs",
-              function: "get_latest_resolvable_version"
-            )
-            expect(error.error_context).not_to have_key(:args)
-            diagnostic_surface = [error.error_context, error.sentry_context].inspect
-            expect(diagnostic_surface).not_to include(
-              organization_token,
-              repository_auth_key,
-              repository_public_key,
-              "url-user",
-              "url-password",
-              "query-secret"
-            )
+            expect(error.message).to include("access_token=***")
+            expect(error.full_message).not_to include("secret%2Bvalue")
+            expect(error.error_context.to_s).not_to include("secret%2Bvalue")
+            expect(error.trace.to_s).not_to include("secret%2Bvalue")
             expect(error.cause).to be_nil
           end
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
-    context "when the helper reports ambiguous repository diagnostics" do
-      let(:diagnostics) do
-        [
-          'Public key fingerprint mismatch for repo "dependabot"',
-          'Downloading public key for repo "dependabot" failed: {:error, :econnrefused}',
-          'Failed to decode public key for repo "dependabot"',
-          "Failed to fetch record for dependabot"
-        ]
+    context "with the target missing from the active environment" do
+      let(:unknown_dependency_error) do
+        helper_failure("** (Mix) Unknown dependency plug for environment prod")
       end
 
-      it "re-raises each original failure unchanged" do
-        diagnostics.each do |diagnostic|
-          ambiguous_error =
-            Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-              message: diagnostic,
-              error_context: {}
-            )
-          stub_update_checks(ambiguous_error, "1.3.6")
+      before { stub_resolution_failure(unknown_dependency_error) }
 
-          expect { latest_resolvable_version }.to raise_error do |error|
-            expect(error).to equal(ambiguous_error)
-          end
-        end
+      it "reports a user-facing file error after one attempt" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotResolvable)
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
-    context "when an unknown update-check failure has no configured query credentials" do
-      let(:unknown_error) do
-        Dependabot::SharedHelpers::HelperSubprocessFailed.new(
-          message: "Unknown update-check failure",
-          error_context: {}
+    context "with a qualified fetch failure and ambiguous access diagnostic" do
+      let(:fetch_error) do
+        helper_failure(
+          <<~ERROR
+            Failed to fetch record for private_repo/plug from registry
+            This could be because the package does not exist, it was spelled incorrectly or you don't have permissions to it
+            ** (Mix) Hex dependency resolution failed
+          ERROR
         )
       end
 
-      before { stub_update_checks(unknown_error, "1.3.6") }
+      before { stub_resolution_failure(fetch_error) }
 
-      it "re-raises the original failure unchanged" do
-        expect { latest_resolvable_version }.to raise_error do |error|
-          expect(error).to equal(unknown_error)
-        end
+      it "preserves the original helper failure after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, fetch_error.message)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "when diagnostics mention multiple private sources" do
+      let(:mixed_source_error) do
+        helper_failure(
+          <<~ERROR
+            Failed to fetch record for first_repo/plug from registry
+            :timeout
+            Failed to fetch record for second_repo/jason from registry
+            Authentication failed (401)
+            ** (Mix) Hex dependency resolution failed
+          ERROR
+        )
+      end
+
+      before { stub_resolution_failure(mixed_source_error) }
+
+      it "preserves the original helper failure instead of correlating diagnostics" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, mixed_source_error.message)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "with an unknown package in the lockfile" do
+      let(:lockfile_error) { helper_failure("Unknown package version plug 9.9.9 in lockfile") }
+
+      before { stub_resolution_failure(lockfile_error) }
+
+      it "keeps the failure internal after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, lockfile_error.message)
+        expect(mix_attempts).to contain_exactly(:resolution)
+      end
+    end
+
+    context "with an unexpected helper exception" do
+      let(:unexpected_error) { helper_failure("** (RuntimeError) unexpected helper failure") }
+
+      before { stub_resolution_failure(unexpected_error) }
+
+      it "keeps the original failure internal after one attempt" do
+        expect { latest_resolvable_version }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, unexpected_error.message)
+        expect(mix_attempts).to contain_exactly(:resolution)
       end
     end
 
     context "without a lockfile" do
-      let(:original_files) { [mixfile] }
       let(:prepared_files) { [sanitized_mixfile] }
 
       it "respects the resolvability of the mix.exs" do
@@ -397,34 +582,21 @@ RSpec.describe Dependabot::Hex::UpdateChecker::VersionResolver do
       end
     end
 
-    def repository_credential(url)
-      Dependabot::Credential.new(
-        {
-          "type" => "hex_repository",
-          "repo" => "dependabot",
-          "url" => url,
-          "public-key-fingerprint" => "SHA256:fingerprint"
-        }
+    def helper_failure(message, error_context = {})
+      Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+        message: message,
+        error_context: error_context
       )
     end
 
-    def stub_update_checks(*results)
-      allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess) do
-        result = results.shift
-        raise result if result.is_a?(StandardError)
-
-        result
-      end
-    end
-
-    def organization_credential(organization, token: "token")
-      Dependabot::Credential.new(
-        {
-          "type" => "hex_organization",
-          "organization" => organization,
-          "token" => token
-        }
-      )
+    def stub_resolution_failure(error)
+      allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_call_original
+      allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+        .with(array_including(end_with("/check_update.exs"), dependency_name), anything)
+        .and_wrap_original do
+          mix_attempts << :resolution
+          raise error
+        end
     end
   end
 end
