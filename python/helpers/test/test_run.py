@@ -45,5 +45,9 @@ class TestRunRouting:
         result = run_helper("parse_requirements", [fixture_dir])
 
         assert "result" in result
-        names = {d["name"] for d in result["result"]}
+        assert result["result"]["schema_version"] == 1
+        names = {
+            declaration["name"]
+            for declaration in result["result"]["declarations"]
+        }
         assert "requests" in names

@@ -50,10 +50,33 @@ RSpec.describe Dependabot::Python::FileParser do
           "markers" => "None",
           "file" => "requirements.txt",
           "requirement" => "==2.31.0",
-          "extras" => ["security"]
+          "source_requirement" => "requests[security]==2.31.0",
+          "extras" => ["security"],
+          "constraint" => false,
+          "editable" => false,
+          "local" => false,
+          "hashes" => [],
+          "source" => { "start_line" => 1, "end_line" => 1 }
         }
       end
-      let(:helper_result) { [helper_record] }
+      let(:helper_result) do
+        {
+          "schema_version" => 1,
+          "declarations" => [helper_record],
+          "files" => [{ "path" => "requirements.txt", "component_id" => "component-0" }],
+          "edges" => [],
+          "roots" => ["requirements.txt"],
+          "components" => [
+            {
+              "id" => "component-0",
+              "files" => ["requirements.txt"],
+              "roots" => ["requirements.txt"],
+              "status" => "complete",
+              "reasons" => []
+            }
+          ]
+        }
+      end
 
       before do
         allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).and_call_original
@@ -106,24 +129,26 @@ RSpec.describe Dependabot::Python::FileParser do
 
         it "reports a malformed requirements result" do
           expect { dependencies }.to raise_error(
-            Dependabot::DependencyFileNotEvaluatable,
-            "parse_requirements result must be an array"
+            Dependabot::Python::InvalidRequirementsFileParserResult,
+            "parse_requirements result must be an object"
           )
         end
       end
 
       context "with a malformed record excluded by its marker" do
         let(:helper_result) do
-          [
-            helper_record,
-            helper_record.merge("name" => "ignored", "markers" => "python_version < \"3.0\"", "extras" => [1])
-          ]
+          super().merge(
+            "declarations" => [
+              helper_record,
+              helper_record.merge("name" => "ignored", "markers" => "python_version < \"3.0\"", "extras" => [1])
+            ]
+          )
         end
 
         it "rejects the complete result before filtering records" do
           expect { dependencies }.to raise_error(
-            Dependabot::DependencyFileNotEvaluatable,
-            /parse_requirements result\[1\].*extras/
+            Dependabot::Python::InvalidRequirementsFileParserResult,
+            /parse_requirements declarations\[1\].*extras/
           )
         end
       end
@@ -448,9 +473,8 @@ RSpec.describe Dependabot::Python::FileParser do
         )
       end
 
-      it "raises a Dependabot::DependencyFileNotEvaluatable error" do
-        expect { parser.parse }
-          .to raise_error(Dependabot::DependencyFileNotEvaluatable)
+      it "parses the cyclic file independently for static updates" do
+        expect(parser.parse.map(&:name)).to eq(["requests"])
       end
     end
 
@@ -668,8 +692,13 @@ RSpec.describe Dependabot::Python::FileParser do
               )
             end
 
-            it "reports the loop rather than parsing nothing" do
-              expect { dependencies }.to raise_error(Dependabot::DependencyFileNotEvaluatable, /recursively references/)
+            it "parses each file independently for static updates" do
+              expect(dependencies.map(&:name)).to eq(["requests"])
+              expect(dependencies.first.requirements)
+                .to contain_exactly(
+                  { requirement: nil, file: "requirements.txt", groups: ["dependencies"], source: nil },
+                  { requirement: "==2.0.0", file: "constraints.txt", groups: ["dependencies"], source: nil }
+                )
             end
 
             context "when another file is a root" do
@@ -678,9 +707,8 @@ RSpec.describe Dependabot::Python::FileParser do
                 Dependabot::DependencyFile.new(name: "requirements-other.txt", content: "certifi==2024.2.2\n")
               end
 
-              it "reports the loop rather than parsing only that root" do
-                expect { dependencies }
-                  .to raise_error(Dependabot::DependencyFileNotEvaluatable, /recursively references/)
+              it "preserves declarations from both the cyclic and rooted components" do
+                expect(dependencies.map(&:name)).to contain_exactly("requests", "certifi")
               end
             end
           end
