@@ -150,6 +150,7 @@ class TestParseRequirementsTxt:
                     "  --hash=sha256:abc \\\n"
                     "  --hash sha256:def # retained declaration comment\n"
                     "-e./local-package\n"
+                    "-e git+https://example.com/repo.git#egg=flask\n"
                     "-r https://example.com/remote.txt\n"
                 ),
                 "child.txt": "urllib3==2.2.3\n",
@@ -173,6 +174,9 @@ class TestParseRequirementsTxt:
         requests = find_dep(result["declarations"], "requests")
         assert requests["source"] == {"start_line": 2, "end_line": 4}
         assert requests["hashes"] == ["sha256:abc", "sha256:def"]
+        flask = find_dep(result["declarations"], "flask")
+        assert flask["editable"] is True
+        assert flask["local"] is False
 
         component = next(
             component for component in result["components"]
@@ -211,6 +215,29 @@ class TestParseRequirementsTxt:
                 "source": {"start_line": 2, "end_line": 2},
             }
         ]
+
+    def test_decodes_bom_encoded_requirement_files(self, tmp_path):
+        (tmp_path / "requirements.txt").write_bytes(
+            "requests==2.31.0\n".encode("utf-16")
+        )
+
+        result = json.loads(parse_requirements(str(tmp_path)))["result"]
+
+        requests = find_dep(result["declarations"], "requests")
+        assert requests["source"] == {"start_line": 1, "end_line": 1}
+
+    def test_normalizes_file_urls_for_declaration_sources(self, tmp_path):
+        child = tmp_path / "child.txt"
+        child.write_text("requests==2.31.0\n")
+        (tmp_path / "requirements.txt").write_text(
+            f"-r {child.resolve().as_uri()}\n"
+        )
+
+        result = json.loads(parse_requirements(str(tmp_path)))["result"]
+
+        requests = find_dep(result["declarations"], "requests")
+        assert requests["file"] == "child.txt"
+        assert requests["source"] == {"start_line": 1, "end_line": 1}
 
     def test_only_parses_selected_entry_files_and_their_references(
         self,

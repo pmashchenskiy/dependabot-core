@@ -161,6 +161,14 @@ RSpec.describe Dependabot::Python::FileParser do
         end
       end
 
+      context "with an editable VCS requirement" do
+        let(:helper_record) { super().merge("editable" => true) }
+
+        it "does not route the dependency through static PyPI updates" do
+          expect(dependencies).to be_empty
+        end
+      end
+
       [
         ["InstallationError: invalid input", Dependabot::DependencyFileNotEvaluatable],
         ["Unexpected helper failure", Dependabot::SharedHelpers::HelperSubprocessFailed]

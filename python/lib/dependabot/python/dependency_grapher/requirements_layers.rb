@@ -134,12 +134,7 @@ module Dependabot
 
         sig { returns(T::Array[Dependabot::DependencyFile]) }
         def constraints_files
-          referenced_constraints = requirements_file_result.edges.filter_map do |edge|
-            edge.to if edge.type == "constraint" && !edge.remote
-          end
-          requirement_family_files.select do |file|
-            referenced_constraints.include?(file.name) || File.basename(file.name).include?("constraint")
-          end
+          requirement_family_files.select { |file| File.basename(file.name).include?("constraint") }
         end
 
         # Collects sibling files referenced via `-r`/`-c`, walking the chain transitively. Returns only newly

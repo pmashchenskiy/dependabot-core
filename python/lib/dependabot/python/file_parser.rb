@@ -407,7 +407,9 @@ module Dependabot
 
       sig { returns(T::Array[RequirementsFileParser::Declaration]) }
       def parsed_requirement_files
-        requirements = requirements_file_result.declarations.reject(&:local)
+        requirements = requirements_file_result.declarations.reject do |declaration|
+          declaration.local || declaration.editable
+        end
         check_requirements(requirements)
         requirements
       end

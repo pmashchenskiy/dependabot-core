@@ -8,6 +8,7 @@ import urllib.request
 
 import configparser
 import pip._internal.req.req_file
+import setuptools
 from pip._internal.exceptions import InstallationError
 from pip._internal.network.session import PipSession
 from pip._internal.req.constructors import (
@@ -344,10 +345,7 @@ class RequirementsFileParser:
         if parsed.scheme and parsed.scheme != "file":
             return target, True
 
-        if parsed.scheme == "file":
-            target_path = urllib.request.url2pathname(parsed.path)
-        else:
-            target_path = target
+        target_path = self._file_url_path(target)
 
         if not os.path.isabs(target_path):
             target_path = os.path.join(
@@ -526,7 +524,9 @@ class RequirementsFileParser:
             )
 
         return (
-            self._relative_path(match.group("filename")),
+            self._relative_local_path(
+                self._file_url_path(match.group("filename"))
+            ),
             int(match.group("line"))
         )
 
@@ -544,8 +544,11 @@ class RequirementsFileParser:
         }
 
     def _physical_line_spans(self, filename):
-        with open(filename, "r") as file:
-            content = file.read()
+        with open(filename, "rb") as file:
+            content = pip._internal.req.req_file._decode_req_file(
+                file.read(),
+                filename
+            )
 
         lines = TrackingLineIterator(content)
         spans = {}
@@ -555,6 +558,14 @@ class RequirementsFileParser:
 
     def _relative_path(self, path):
         return os.path.relpath(path, self.directory)
+
+    @staticmethod
+    def _file_url_path(path):
+        parsed = urllib.parse.urlparse(path)
+        if parsed.scheme == "file":
+            return urllib.request.url2pathname(parsed.path)
+
+        return path
 
     def _relative_local_path(self, path):
         absolute_path = os.path.abspath(path)
@@ -587,9 +598,6 @@ class RequirementsFileParser:
 
 
 def parse_setup(directory):
-    global setuptools
-    import setuptools
-
     def version_from_install_req(install_req):
         if install_req.is_pinned:
             return next(iter(install_req.specifier)).version
