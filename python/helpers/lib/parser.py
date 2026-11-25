@@ -7,14 +7,6 @@ import urllib.parse
 import urllib.request
 
 import configparser
-import pip._internal.req.req_file
-import setuptools
-from pip._internal.exceptions import InstallationError
-from pip._internal.network.session import PipSession
-from pip._internal.req.constructors import (
-    install_req_from_line,
-    install_req_from_parsed_requirement,
-)
 
 from packaging.requirements import InvalidRequirement, Requirement
 # TODO: Replace 3p package `tomli` with 3.11's new stdlib `tomllib` once we
@@ -204,11 +196,23 @@ class TrackingLineIterator:
 
 class RequirementsFileParser:
     def __init__(self, directory, requirement_files=None):
+        import pip._internal.req.req_file as req_file
+        from pip._internal.exceptions import InstallationError
+        from pip._internal.network.session import PipSession
+        from pip._internal.req.constructors import (
+            install_req_from_parsed_requirement,
+        )
+
         self.directory = os.path.abspath(directory)
         self.requirement_files = requirement_files
+        self.req_file = req_file
+        self.installation_error = InstallationError
+        self.install_req_from_parsed_requirement = (
+            install_req_from_parsed_requirement
+        )
         self.session = PipSession()
-        self.line_parser = pip._internal.req.req_file.get_line_parser(None)
-        self.pip_parser = pip._internal.req.req_file.RequirementsFileParser(
+        self.line_parser = self.req_file.get_line_parser(None)
+        self.pip_parser = self.req_file.RequirementsFileParser(
             self.session,
             self.line_parser
         )
@@ -284,7 +288,7 @@ class RequirementsFileParser:
             direct_requirements = []
 
             for line in self.pip_parser._parse_file(absolute_path, False):
-                parsed_requirement = pip._internal.req.req_file.handle_line(
+                parsed_requirement = self.req_file.handle_line(
                     line,
                     session=self.session
                 )
@@ -305,7 +309,7 @@ class RequirementsFileParser:
                 target = edge["to"]
                 target_path = os.path.join(self.directory, target)
                 if not os.path.isfile(target_path):
-                    raise InstallationError(
+                    raise self.installation_error(
                         "Could not open requirements file: "
                         f"[Errno 2] No such file or directory: '{target_path}'"
                     )
@@ -457,7 +461,7 @@ class RequirementsFileParser:
                     requirement
                     for root in component["roots"]
                     for requirement in
-                    pip._internal.req.req_file.parse_requirements(
+                    self.req_file.parse_requirements(
                         os.path.join(self.directory, root),
                         session=self.session
                     )
@@ -489,7 +493,9 @@ class RequirementsFileParser:
         return list(declarations.values())
 
     def _declaration(self, parsed_requirement):
-        install_req = install_req_from_parsed_requirement(parsed_requirement)
+        install_req = self.install_req_from_parsed_requirement(
+            parsed_requirement
+        )
         if install_req.req is None:
             return None
 
@@ -510,7 +516,9 @@ class RequirementsFileParser:
         }
 
     def _is_local_path(self, parsed_requirement):
-        install_req = install_req_from_parsed_requirement(parsed_requirement)
+        install_req = self.install_req_from_parsed_requirement(
+            parsed_requirement
+        )
         return install_req.link is not None and install_req.link.is_file
 
     def _requirement_source(self, parsed_requirement):
@@ -545,14 +553,14 @@ class RequirementsFileParser:
 
     def _physical_line_spans(self, filename):
         with open(filename, "rb") as file:
-            content = pip._internal.req.req_file._decode_req_file(
+            content = self.req_file._decode_req_file(
                 file.read(),
                 filename
             )
 
         lines = TrackingLineIterator(content)
         spans = {}
-        for start_line, _ in pip._internal.req.req_file.join_lines(lines):
+        for start_line, _ in self.req_file.join_lines(lines):
             spans[start_line] = lines.last_line_number
         return spans
 
@@ -571,7 +579,7 @@ class RequirementsFileParser:
         absolute_path = os.path.abspath(path)
         common_path = os.path.commonpath([self.directory, absolute_path])
         if common_path != self.directory:
-            raise InstallationError(
+            raise self.installation_error(
                 "Requirements file is outside the fetched source directory: "
                 f"'{absolute_path}'"
             )
@@ -598,6 +606,10 @@ class RequirementsFileParser:
 
 
 def parse_setup(directory):
+    global setuptools
+    import setuptools
+    from pip._internal.req.constructors import install_req_from_line
+
     def version_from_install_req(install_req):
         if install_req.is_pinned:
             return next(iter(install_req.specifier)).version
